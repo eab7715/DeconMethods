@@ -1,0 +1,105 @@
+ 
+ ########################
+ # CDseq Method
+ ########################
+ 
+ devtools::install_github("immunogenomics/harmony")
+ 
+ 
+ # Install and load packages for CDseq
+install_cdseq_packages <- function() {
+   if (!requireNamespace("devtools", quietly = TRUE)) {
+     install.packages("devtools")
+   }
+   if (!requireNamespace("CDseq", quietly = TRUE)) {
+     message("Installing CDseq package...")
+     devtools::install_github("kkang7/CDSeq_R_Package")
+   }
+   library(CDseq)
+   message("CDseq and dependencies loaded successfully")
+ }
+ 
+ install_cdseq_packages()
+ 
+ 
+ # Run CDseq deconvolution
+ run_cdseq <- function(reference_matrix, mixture_matrix, n_iterations = 50) {
+   # Make sure packages are installed
+   install_cdseq_packages()
+   
+   # Transpose mixture data for CDseq format (genes as rows, samples as columns)
+   # CDseq works with raw counts, so make sure data is not normalized
+   mixture_data <- t(as.matrix(mixture_matrix))
+   
+   message("Running CDseq deconvolution...")
+   
+   # Determine number of cell types from reference
+   K <- ncol(reference_matrix)
+   message(paste("Using", K, "cell types based on reference matrix"))
+   
+   # Run CDseq
+   cdseq_results <- CDSeq(
+     counts = mixture_data,
+     niter = n_iterations,
+     K = K,
+     beta = 0.5,  # Default value
+     alpha = NULL,  # Will be estimated from data
+     parallel = TRUE,
+     cores = min(parallel::detectCores() - 1, 4)  # Use multiple cores but leave 1 for system
+   )
+   
+   # Extract cell-type proportions
+   proportions <- cdseq_results$estProp
+   rownames(proportions) <- colnames(reference_matrix)  # Use reference cell type names
+   colnames(proportions) <- colnames(mixture_matrix)    # Use mixture sample names
+   
+   # Transpose to match the format of other methods (cell types as columns, samples as rows)
+   proportions <- t(proportions)
+   
+   # Create results dataframe
+   results_df <- as.data.frame(proportions)
+   results_df$Sample <- rownames(results_df)
+   results_df <- results_df %>% select(Sample, everything())
+   
+   # Save results
+   write.csv(results_df, "cdseq_deconv_results.csv", row.names = FALSE)
+   message("CDseq results saved to cdseq_deconv_results.csv")
+   
+   # Create a simple visualization
+   plot_cdseq_results(results_df)
+   
+   return(list(
+     proportions = proportions,
+     cell_signatures = cdseq_results$estGEP,
+     model = cdseq_results,
+     results_df = results_df
+   ))
+ }
+ 
+ # Visualize CDseq results
+ plot_cdseq_results <- function(results_df) {
+   library(ggplot2)
+   
+   # Convert to long format for plotting
+   plot_data <- results_df %>%
+     pivot_longer(cols = -Sample, names_to = "Cell_Type", values_to = "Proportion")
+   
+   # Create plot
+   p <- ggplot(plot_data, aes(x = Sample, y = Proportion, fill = Cell_Type)) +
+     geom_bar(stat = "identity") +
+     theme_minimal() +
+     labs(title = "CDseq: Cell Type Proportions in Mixture Samples",
+          x = "Sample",
+          y = "Proportion",
+          fill = "Cell Type") +
+     theme(axis.text.x = element_text(angle = 45, hjust = 1))
+   
+   # Save plot
+   ggsave("cdseq_proportions.png", p, width = 10, height = 6, dpi = 300)
+   message("CDseq plot saved to cdseq_proportions.png")
+   
+   return(p)
+ }
+ 
+ # Example usage
+ cdseq_results <- run_cdseq(deconv_ready$reference_matrix, deconv_ready$mixture_matrix)
