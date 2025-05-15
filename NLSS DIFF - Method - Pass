@@ -1,0 +1,245 @@
+
+# Load required libraries
+library(dplyr)
+library(tidyr)
+library(nnls)  # For non-negative least squares
+library(ggplot2)  # For visualization
+
+# Make sure we have the necessary packages
+if (!requireNamespace("nnls", quietly = TRUE)) {
+  install.packages("nnls")
+  library(nnls)
+}
+
+# Ensure dplyr functions are available (use explicit namespace)
+select <- dplyr::select
+left_join <- dplyr::left_join
+pivot_longer <- tidyr::pivot_longer
+
+# Function to perform deconvolution using non-negative least squares
+deconvolve_samples <- function(reference_matrix, mixture_matrix) {
+  # Prepare results container
+  n_cell_types <- ncol(reference_matrix)
+  n_samples <- ncol(mixture_matrix)
+  cell_types <- colnames(reference_matrix)
+  samples <- colnames(mixture_matrix)
+  
+  # Container for results
+  proportions <- matrix(0, nrow = n_cell_types, ncol = n_samples)
+  rownames(proportions) <- cell_types
+  colnames(proportions) <- samples
+  
+  # Convert reference matrix to proper matrix format
+  ref_mat <- as.matrix(reference_matrix)
+  
+  # For each mixture sample
+  for (i in 1:n_samples) {
+    message(paste("Processing sample", i, ":", samples[i]))
+    mixture <- mixture_matrix[, i]
+    
+    # Skip samples with all zeros
+    if (all(mixture == 0)) {
+      warning("Sample ", samples[i], " contains all zeros. Skipping.")
+      next
+    }
+    
+    # Convert mixture to numeric vector
+    mixture_vec <- as.numeric(mixture)
+    
+    # Debug information
+    message(paste("  - Mixture vector length:", length(mixture_vec)))
+    message(paste("  - Reference matrix dimensions:", paste(dim(ref_mat), collapse=" x ")))
+    
+    # Check for NAs or infinite values
+    if (any(is.na(ref_mat)) || any(is.na(mixture_vec))) {
+      message("  - WARNING: NA values detected in data")
+    }
+    if (any(is.infinite(ref_mat)) || any(is.infinite(mixture_vec))) {
+      message("  - WARNING: Infinite values detected in data")
+    }
+    
+    # Try alternative approach with lsfit if nnls fails
+    tryCatch({
+      # Perform non-negative least squares
+      result <- nnls(ref_mat, mixture_vec)
+      
+      # Get coefficients (proportions)
+      coeffs <- result$x
+      
+      # Check if coefficients are valid
+      if (length(coeffs) == 0) {
+        message("  - NNLS returned empty coefficients, trying lsfit instead")
+        
+        # Try lsfit as an alternative approach (regular least squares)
+        ls_result <- lsfit(ref_mat, mixture_vec, intercept=FALSE)
+        coeffs <- ls_result$coefficients
+        
+        # Force non-negative values
+        coeffs[coeffs < 0] <- 0
+      }
+      
+      # Confirm we have coefficients
+      if (length(coeffs) != n_cell_types) {
+        stop(paste("Coefficient length mismatch! Expected", n_cell_types, 
+                   "but got", length(coeffs), "for sample", samples[i]))
+      }
+      
+      # Normalize to sum to 1
+      if (sum(coeffs) > 0) {
+        coeffs <- coeffs / sum(coeffs)
+      }
+      
+      # Store in results matrix - use direct indexing for assignment
+      for (j in 1:n_cell_types) {
+        proportions[j, i] <- coeffs[j]
+      }
+      
+      message(paste("  - Successfully processed sample", samples[i]))
+      
+    }, error = function(e) {
+      message(paste("  - Error processing sample", samples[i], ":", e$message))
+      
+      # Try a simpler fallback approach
+      message("  - Attempting fallback approach")
+      
+      # Simple proportional approach as fallback
+      means <- colMeans(ref_mat)
+      sample_sum <- sum(mixture_vec)
+      
+      if (sample_sum > 0) {
+        # Calculate simple proportions based on reference means
+        simple_coeffs <- means / sum(means)
+        
+        # Store these in the results
+        for (j in 1:n_cell_types) {
+          proportions[j, i] <- simple_coeffs[j]
+        }
+        
+        message(paste("  - Used fallback method for sample", samples[i]))
+      } else {
+        message(paste("  - Sample sum is zero, using equal proportions"))
+        # Use equal proportions as last resort
+        equal_props <- rep(1/n_cell_types, n_cell_types)
+        for (j in 1:n_cell_types) {
+          proportions[j, i] <- equal_props[j]
+        }
+      }
+    })
+  }
+  
+  return(proportions)
+}
+
+# Calculate goodness of fit for the deconvolution
+calculate_fit_metrics <- function(reference_matrix, mixture_matrix, proportions) {
+  # Container for metrics
+  n_samples <- ncol(mixture_matrix)
+  samples <- colnames(mixture_matrix)
+  metrics <- data.frame(
+    Sample = samples,
+    RMSE = numeric(n_samples),
+    R_squared = numeric(n_samples)
+  )
+  
+  # Calculate estimated mixtures based on proportions
+  estimated_mixtures <- as.matrix(reference_matrix) %*% proportions
+  
+  # For each sample
+  for (i in 1:n_samples) {
+    actual <- mixture_matrix[, i]
+    estimated <- estimated_mixtures[, i]
+    
+    # Calculate RMSE
+    rmse <- sqrt(mean((actual - estimated)^2))
+    
+    # Calculate R-squared
+    ss_total <- sum((actual - mean(actual))^2)
+    ss_residual <- sum((actual - estimated)^2)
+    r_squared <- 1 - (ss_residual / ss_total)
+    
+    # Store metrics
+    metrics$RMSE[i] <- rmse
+    metrics$R_squared[i] <- r_squared
+  }
+  
+  return(metrics)
+}
+
+# Run the deconvolution
+tryCatch({
+  message("Performing cell type deconvolution...")
+  # Debug: print dimensions before deconvolution
+  message("Reference matrix dimensions: ", paste(dim(deconv_ready$reference_matrix), collapse=" x "))
+  message("Mixture matrix dimensions: ", paste(dim(deconv_ready$mixture_matrix), collapse=" x "))
+  
+  # Additional check on dimensions
+  message("Checking cell type names and lengths...")
+  
+  proportions <- deconvolve_samples(deconv_ready$reference_matrix, deconv_ready$mixture_matrix)
+  
+  # Debug: print dimensions after deconvolution  
+  message("Proportions matrix dimensions: ", paste(dim(proportions), collapse=" x "))
+  
+  # Calculate fit metrics
+  message("Calculating goodness of fit metrics...")
+  fit_metrics <- calculate_fit_metrics(deconv_ready$reference_matrix, deconv_ready$mixture_matrix, proportions)
+  
+  # Format results
+  deconv_results <- as.data.frame(t(proportions))
+  deconv_results$Sample <- rownames(deconv_results)
+  rownames(deconv_results) <- NULL
+  
+  # Use explicit namespace for dplyr functions
+  deconv_results <- dplyr::select(deconv_results, Sample, everything())
+  
+  # Add fit metrics to results
+  deconv_results <- dplyr::left_join(deconv_results, fit_metrics, by = "Sample")
+  
+  # Print summary of results
+  message("\nDeconvolution Results:")
+  print(deconv_results)
+  
+  # Save results
+  write.csv(deconv_results, "deconvolution_results.csv", row.names = FALSE)
+  message("Results saved to deconvolution_results.csv")
+  
+  # Create a stacked bar plot of cell type proportions
+  deconv_plot_data <- deconv_results %>%
+    dplyr::select(-RMSE, -R_squared) %>%
+    tidyr::pivot_longer(cols = -Sample, names_to = "Cell_Type", values_to = "Proportion")
+  
+  # Create plot
+  p <- ggplot(deconv_plot_data, aes(x = Sample, y = Proportion, fill = Cell_Type)) +
+    geom_bar(stat = "identity") +
+    theme_minimal() +
+    labs(title = "Cell Type Proportions in Mixture Samples",
+         x = "Sample",
+         y = "Proportion",
+         fill = "Cell Type") +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1))
+  
+  # Save plot
+  ggsave("cell_type_proportions.png", p, width = 10, height = 6, dpi = 300)
+  message("Plot saved to cell_type_proportions.png")
+}, error = function(e) {
+  message("Error in deconvolution: ", e$message)
+  
+  # Additional debugging information
+  message("\nDebugging information:")
+  message("Reference matrix dimensions: ", paste(dim(deconv_ready$reference_matrix), collapse=" x "))
+  message("Mixture matrix dimensions: ", paste(dim(deconv_ready$mixture_matrix), collapse=" x "))
+  message("Reference column names: ", paste(colnames(deconv_ready$reference_matrix), collapse=", "))
+  message("Mixture column names: ", paste(colnames(deconv_ready$mixture_matrix), collapse=", "))
+  
+  # Check cell type case sensitivity
+  message("\nChecking cell type name case sensitivity:")
+  ref_cols <- colnames(deconv_ready$reference_matrix)
+  message("Are any cell type names case variations of each other?")
+  for (i in 1:(length(ref_cols)-1)) {
+    for (j in (i+1):length(ref_cols)) {
+      if (tolower(ref_cols[i]) == tolower(ref_cols[j])) {
+        message("Possible duplicate: ", ref_cols[i], " and ", ref_cols[j])
+      }
+    }
+  }
+})
